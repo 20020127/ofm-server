@@ -1,0 +1,22 @@
+# 运行时数据（含明文凭据，绝不入库）
+data/
+*.log
+
+# 测试/验证残留
+.test-data/
+.verify-data/
+.redact-test/
+.pylibs/
+
+# 内部推送工具（token 经参数传入，不入库）
+tools/api-push.py
+
+# 系统杂项
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

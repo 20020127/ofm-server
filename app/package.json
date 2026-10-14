@@ -1,0 +1,15 @@
+{
+  "name": "our-free-model-server",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Our Free Model 独立服务（服务器部署版）——OpenAI 兼容网关，聚合匿名免费通道、Kilo 免费池、EAC 协付渠道与十三个账号渠道",
+  "main": "./cli.mjs",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "license": "MIT",
+  "scripts": {
+    "start": "node cli.mjs"
+  }
+}

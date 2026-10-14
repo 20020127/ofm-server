@@ -1,0 +1,45 @@
+[Unit]
+Description=Our Free Model standalone server (OpenAI-compatible gateway)
+After=network-online.target
+Wants=network-online.target
+Documentation=file:/opt/ofm/README.md
+
+[Service]
+Type=simple
+User=ofm
+Group=ofm
+WorkingDirectory=/opt/ofm/app
+Environment=OFM_HOME=/var/lib/ofm
+Environment=NODE_ENV=production
+# Node 堆上限按服务器内存调整；默认约 2GB 以上可不开
+# Environment=NODE_OPTIONS=--max-old-space-size=2048
+ExecStart=/usr/bin/node cli.mjs --port 18900 --data-dir /var/lib/ofm
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+# 优雅退出：SIGTERM 会关闭监听、清理 service.lock
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30s
+
+# —— 安全加固（按需调整）——
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# 数据目录唯一可写位置（API Key / 账号凭据 / 账目）
+ReadWritePaths=/var/lib/ofm
+# 渠道适配器需要出网；不限制地址族
+AmbientCapabilities=
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

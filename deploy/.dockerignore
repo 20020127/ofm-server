@@ -1,0 +1,10 @@
+# 构建上下文排除项（构建上下文为项目根，Dockerfile 位于 deploy/）
+**/node_modules
+**/*.log
+.test-data
+upstream
+docs
+tools
+.git
+*.md
+!app/UPSTREAM.md
