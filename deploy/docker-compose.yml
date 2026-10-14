@@ -1,34 +1,126 @@
+# Our Free Model —— 生产编排（单容器：OFM 服务 + nginx 反代）
+#
+# 用法（在项目根目录 ofm-server/ 下执行）：
+#   docker compose -f deploy/docker-compose.yml up -d --build      # 构建并启动
+#   docker compose -f deploy/docker-compose.yml ps                # 看状态与健康检查
+#   docker compose -f deploy/docker-compose.yml logs -f --tail=200 # 看日志
+#   docker compose -f deploy/docker-compose.yml down              # 停止并删除容器（卷保留）
+#
+# 需要 Docker Compose v2.24+（用了 env_file 的 required: false 长写法）。
+# 旧版本请把 env_file 改成短写法 `- ./env/ofm.env` 并先执行
+#   cp deploy/env/ofm.env.example deploy/env/ofm.env
+#
+# 注意：本文件内所有相对路径都以「本文件所在目录 deploy/」为基准，不是当前工作目录。
+
+name: ofm
+
 services:
   ofm:
     build:
-      context: ..
+      context: ..                      # 构建上下文是项目根（Dockerfile 在 deploy/ 下）
       dockerfile: deploy/Dockerfile
+      args:
+        OFM_VERSION: "1.0.0"
+        # 建议改成实际提交号，便于确认线上跑的是哪个版本：
+        # OFM_REVISION: "abc1234"
     image: our-free-model-server:latest
     container_name: ofm
+
+    # ── 重启策略 ──
+    # 入口是「监督模式」：服务或 nginx 任一退出，容器就带着对应退出码退出，
+    # 因此 unless-stopped 能真正覆盖「服务进程崩溃但反代还活着」这种半边故障
+    # （上一版 exec nginx 时容器不会退，健康检查只标 unhealthy，服务永久 502）。
     restart: unless-stopped
+    stop_signal: SIGTERM               # 与镜像 tini 的转发行为对齐
+    stop_grace_period: 40s             # 必须 > 下面的 OFM_STOP_TIMEOUT，给优雅退出留余量
+    # 刻意不写 init: true —— 镜像 ENTRYPOINT 已内置 tini 作 PID1。
+    # 依赖运行时注入 init 会让「直接 docker run」的人丢掉这层保护。
+
+    # ── 环境变量 ──
+    env_file:
+      - path: ./env/ofm.env            # 可选：真实凭据 / 出站代理 / 堆上限按需写入
+        required: false                # 文件不存在也不报错（Compose ≥ 2.24）
     environment:
-      # 数据目录（卷挂载点）：API Key、账号凭据、EAC 授权、账目统计都在这里
       OFM_HOME: /data
-      # 容器内 OFM 服务端口（仅回环）与 nginx 对外端口
-      OFM_PORT: "18900"
-      OFM_PROXY_PORT: "8080"
-      # 需要访问 Google（Gemini 渠道）等站点时，按需配置代理：
+      OFM_PORT: "18900"                # 服务端口（仅容器回环，不对外）
+      OFM_PROXY_PORT: "8080"           # nginx 对外端口
+      OFM_STARTUP_TIMEOUT: "60"        # 就绪等待上限（秒），超时即判启动失败
+      OFM_STOP_TIMEOUT: "25"           # SIGTERM 后强制 SIGKILL 的兜底时限（秒）
+      # V8 默认堆上限按「宿主机物理内存」推算，不看 cgroup 限额：
+      # 不显式压低时，2G 限额的容器在 64G 宿主机上会被 OOM Killer 直接杀掉
+      # （表现为 exit 137、无任何错误日志）。经验值 ≈ 内存上限的 50%~60%。
+      NODE_OPTIONS: "--max-old-space-size=1024"
+      # 需要经代理访问 Google（Gemini 渠道）等站点时取消注释：
       # HTTPS_PROXY: "http://host.docker.internal:7890"
       # NO_PROXY: "127.0.0.1,localhost"
-      # 额外启动参数，例如 "--no-refresh" 跳过启动刷新
-      OFM_EXTRA_ARGS: ""
+
     volumes:
+      # 状态目录：明文渠道凭据 + API Key + EAC 授权 + 账目统计。
+      # 必须持久化；备份时务必加密（含明文凭据）。
       - ofm-data:/data
+
     ports:
-      # 默认只发布到宿主机回环；对外暴露请改 "80:8080" 或 "443:8080"，
-      # 并前置你自己的 TLS 反代 / 安全组。
+      # 默认只发布到宿主机回环 —— 服务不经 TLS 直接对外是危险的。
+      # 对外暴露请改 "80:8080" / "443:8080"，并前置你自己的 TLS 反代 / 安全组白名单，
+      # 或改用 deploy/nginx/ofm-tls.conf 那套（裸机 + certbot）。
       - "127.0.0.1:8080:8080"
-    # 健康检查镜像内置；此处覆盖为更快的间隔
+
+    # ── 资源限制：防止单实例吃光宿主机 ──
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+    pids_limit: 512                    # Node 主线程 + 渠道 Worker + nginx worker，512 足够
+    ulimits:
+      # 必须在进程创建时给足：非 root 的 nginx 无法自行抬高 hard limit（见 docker/nginx.conf 注释）
+      nofile:
+        soft: 65536
+        hard: 65536
+      core:                            # 不产出 core dump：内存转储里可能有明文凭据
+        soft: 0
+        hard: 0
+
+    # ── 安全加固 ──
+    security_opt:
+      - no-new-privileges:true         # 禁止 setuid 提权
+    cap_drop:
+      - ALL                            # 服务与 nginx 监听的都是非特权端口，不需要任何 capability
+    # 根文件系统只读：可写处只有下面显式声明的位置。
+    # 与 systemd 单元的 ProtectSystem=strict 是同一思路（两套部署方式加固强度对齐）。
+    # 已核实：应用全部落盘路径都在 OFM_HOME 之下 —— settings.json / service.lock /
+    # channel-credentials.json / eac-user.json / egress/mihomo.yaml /
+    # channel-pack/codearts-cache/；能力目录缓存由入口把 DSH_HOME 指到 OFM_HOME 一并纳入。
+    # 万一遇到 EROFS 报错（例如启用出站代理订阅模式后 mihomo 想写别处），
+    # 临时把这一行改成 read_only: false 即可，并在 docs/PRODUCTION.md 记录原因。
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777        # nginx pid + 生成的配置 + Node 临时文件
+      - /run:size=4m,mode=0755
+      # nginx 的 client_body / proxy 临时目录；uid/gid 对齐镜像里的 ofm 账号
+      - /var/lib/nginx/tmp:size=64m,uid=10001,gid=10001,mode=0750
+
+    # ── 日志：json-file 驱动默认不轮转，长期运行会把磁盘写满 ──
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"                  # 单容器日志总量上限 100MB
+
     healthcheck:
+      # 走 nginx 端口：同时覆盖「反代挂了」和「后端挂了」两种半边故障
+      test: ["CMD", "curl", "-fsS", "--max-time", "4", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 5s
-      start_period: 20s
+      start_period: 60s                # 与 OFM_STARTUP_TIMEOUT 对齐，避免启动期误判
       retries: 3
 
 volumes:
   ofm-data:
+    # 生产建议固定到宿主机目录或加密块设备，便于独立备份与磁盘加密：
+    # driver_opts:
+    #   type: none
+    #   device: /srv/ofm/data
+    #   o: bind
+    # 使用 bind mount 时必须先在宿主机授权（容器内的 ofm 是 uid/gid 10001）：
+    #   sudo mkdir -p /srv/ofm/data && sudo chown 10001:10001 /srv/ofm/data && sudo chmod 700 /srv/ofm/data

@@ -84,24 +84,48 @@ function rewrite(relTarget, text) {
 /**
  * 密钥脱敏：上游 business.mjs 逆向自带的第三方硬编码凭据，公开仓库不再分发。
  * 替换为环境变量覆盖 + 空默认值（未配置时对应渠道不可用，属预期行为）。
- * 防呆：替换后仍能匹配到原密钥字面量则构建失败（防止上游更新后静默漏脱敏）。
+ *
+ * 规则按「变量名/属性名 + 引号字符串」的**结构**匹配，而不是按密钥字面量匹配：
+ * 若写成字面量，脱敏脚本自身就把四个真实凭据写进了公开仓库，脚本反倒成了泄漏源。
+ * 结构匹配同时更耐上游轮换——密钥值换了仍然命中。
+ *
+ * 两层防呆（任一触发即构建失败）：
+ *   1) 替换后规则仍能命中 → 说明脱敏未生效；
+ *   2) FORBIDDEN_SHAPES 形态扫描 → 兜住「上游改了变量名但凭据形态不变」的漏网情况。
+ * 已知边界：Loomy / Raccoon 两处凭据没有可辨识前缀，若上游同时改掉变量名与取值，
+ * 形态扫描无法覆盖，只能靠人工复核（见 docs/COMPLIANCE.md 第 1b 节）。
  */
 const REDACTIONS = [
-  ['accessKeyId: "2thryby66wxi53sk"', 'accessKeyId: process.env.OFM_LOOMY_ACCESS_KEY_ID || ""'],
-  ['accessKeySecret: "zsak6eadrbawz683wf5r3m2snrwj868r"', 'accessKeySecret: process.env.OFM_LOOMY_ACCESS_KEY_SECRET || ""'],
-  ['var RACCOON_PHONE_CIPHER_SECRET = "senseraccoon2023"', 'var RACCOON_PHONE_CIPHER_SECRET = process.env.OFM_RACCOON_PHONE_CIPHER_SECRET || ""'],
-  ['var GEMINI_DEFAULT_CLIENT_SECRET = "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"', 'var GEMINI_DEFAULT_CLIENT_SECRET = process.env.CMDC_PAK_GOOGLE_CLIENT_SECRET || ""'],
+  [/accessKeyId:\s*"[A-Za-z0-9]{16}"/, 'accessKeyId: process.env.OFM_LOOMY_ACCESS_KEY_ID || ""'],
+  [/accessKeySecret:\s*"[A-Za-z0-9]{32}"/, 'accessKeySecret: process.env.OFM_LOOMY_ACCESS_KEY_SECRET || ""'],
+  [/var RACCOON_PHONE_CIPHER_SECRET = "[^"]*"/, 'var RACCOON_PHONE_CIPHER_SECRET = process.env.OFM_RACCOON_PHONE_CIPHER_SECRET || ""'],
+  [/var GEMINI_DEFAULT_CLIENT_SECRET = "GOCSPX-[A-Za-z0-9_-]+"/, 'var GEMINI_DEFAULT_CLIENT_SECRET = process.env.CMDC_PAK_GOOGLE_CLIENT_SECRET || ""'],
 ]
-const SECRET_LITERALS = REDACTIONS.map(([lit]) => lit)
+
+/** 凭据「形态」清单：只描述形状，不含任何真实密钥，供二次兜底扫描使用。 */
+const FORBIDDEN_SHAPES = [
+  ['Google OAuth 客户端密钥', /GOCSPX-[A-Za-z0-9_-]{20,}/],
+  ['OpenAI 风格 API Key', /sk-[A-Za-z0-9]{32,}/],
+  ['JWT', /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/],
+]
+
 function redactSecrets(text, relFor) {
-  for (const [lit, rep] of REDACTIONS) {
-    if (!text.includes(lit)) continue
-    text = text.replaceAll(lit, rep)
-    console.log(`  redact: ${relFor} <- ${lit.slice(0, 48)}…`)
+  for (const [re, rep] of REDACTIONS) {
+    if (!new RegExp(re.source).test(text)) continue
+    text = text.replace(new RegExp(re.source, 'g'), rep)
+    console.log(`  redact: ${relFor} <- ${rep.replace(/process\.env\./, '')}`)
   }
-  for (const lit of SECRET_LITERALS) {
-    if (text.includes(lit)) {
-      console.error(`脱敏失败：${relFor} 仍包含密钥字面量 ${lit.slice(0, 48)}…`)
+  for (const [re] of REDACTIONS) {
+    if (new RegExp(re.source).test(text)) {
+      console.error(`脱敏失败：${relFor} 仍匹配规则 ${re.source}`)
+      process.exit(1)
+    }
+  }
+  for (const [name, shape] of FORBIDDEN_SHAPES) {
+    const m = text.match(shape)
+    if (m) {
+      console.error(`脱敏失败：${relFor} 残留疑似${name}（形态 ${shape.source}，命中 ${m[0].length} 字符）`)
+      console.error('  如确认不是凭据，请更新 FORBIDDEN_SHAPES；否则应先补脱敏规则。')
       process.exit(1)
     }
   }

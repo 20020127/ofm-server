@@ -1,28 +1,89 @@
 [Unit]
 Description=Our Free Model standalone server (OpenAI-compatible gateway)
+Documentation=file:/opt/ofm/README.md
+Documentation=file:/opt/ofm/docs/PRODUCTION.md
 After=network-online.target
 Wants=network-online.target
-Documentation=file:/opt/ofm/README.md
+
+# 启动频率限制：崩溃循环时不要无限重启，也不要静默地一直重启。
+# 300 秒内失败 10 次即停止尝试并把单元标为 failed（便于告警系统抓到）。
+# 注意这两项属于 [Unit]（systemd 229 起从 [Service] 迁到这里，写在 [Service] 会告警且不生效）。
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
 User=ofm
 Group=ofm
 WorkingDirectory=/opt/ofm/app
+
+# ── 环境变量 ──
+# 顺序很重要：先默认值、后环境文件，/etc/default/ofm 里的同名项才能覆盖默认值。
 Environment=OFM_HOME=/var/lib/ofm
 Environment=NODE_ENV=production
-# Node 堆上限按服务器内存调整；默认约 2GB 以上可不开
-# Environment=NODE_OPTIONS=--max-old-space-size=2048
-ExecStart=/usr/bin/node cli.mjs --port 18900 --data-dir /var/lib/ofm
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
+# 渠道包把「模型能力目录」缓存写到 $DSH_HOME/cache 下，而那条路径只认 DSH_HOME。
+# 指向数据目录，保证全部持久状态只有一处 —— 备份/迁移只需搬一个目录。
+Environment=DSH_HOME=/var/lib/ofm
+# V8 的默认堆上限按「物理内存」而不是 cgroup 限额推算。不显式压低时，
+# 大内存机器上会先被 OOM Killer 杀掉（exit 137、无错误日志）而不是先 GC。
+# 经验值 ≈ MemoryMax 的 50%~60%，请与下面的内存限制一起调整。
+Environment=NODE_OPTIONS=--max-old-space-size=1024
+# 可选覆盖项（端口 / 出站代理 / 额外参数），文件不存在也不报错：
+#   /etc/default/ofm 内容示例：
+#     HTTPS_PROXY=http://127.0.0.1:7890
+#     NO_PROXY=127.0.0.1,localhost
+#     OFM_EXTRA_ARGS=--no-refresh
+#     NODE_OPTIONS=--max-old-space-size=2048
+EnvironmentFile=-/etc/default/ofm
+
+# ── 启动 ──
+# 启动前先判定 service.lock 是否为陈旧残留：进程被 SIGKILL（OOM、宿主断电、超时强停）
+# 后锁文件会残留，导致之后每次启动都 EEXIST 失败 —— 表现为「服务再也起不来，必须人工删锁」。
+ExecStartPre=/opt/ofm/scripts/clear-stale-lock.sh /var/lib/ofm
+# $OFM_EXTRA_ARGS 必须是「独立一个词」且不加引号：systemd 对它按空白拆分成多个参数，
+# 写成 ${OFM_EXTRA_ARGS} 会变成一个空字符串参数并直接启动失败。
+ExecStart=/usr/bin/node cli.mjs --port 18900 --data-dir /var/lib/ofm $OFM_EXTRA_ARGS
+# 等真正开始应答才认为启动完成：Type=simple 在 fork 出进程时就算「已启动」，
+# 而本服务还要初始化渠道 Worker、刷新模型目录（数十秒）。没有这一步，
+# `systemctl start ofm && curl ...` 这种写法（部署脚本、自动化）必然误判。
+ExecStartPost=/opt/ofm/scripts/wait-ready.sh http://127.0.0.1:18900 60
+
+# 刻意不设 ExecReload：本服务只注册了 SIGINT/SIGTERM（cli.mjs），不处理 SIGHUP，
+# 而 SIGHUP 的默认动作是终止进程 —— 上一版的 ExecReload=/bin/kill -HUP $MAINPID
+# 会让 `systemctl reload ofm` 把服务直接杀掉。需要重载配置一律用 restart。
+
+# ── 自动重启 ──
+Restart=always
 RestartSec=5s
-# 优雅退出：SIGTERM 会关闭监听、清理 service.lock
+# 为什么不是 on-failure：进程「正常退出」不等于「应该退出」。
+# 服务自身不会主动退出，退出即异常（正常停机走 systemctl stop，不受 Restart 策略影响），
+# on-failure 会让一次干净的意外退出变成永久停机。
+
+# ── 停机 ──
+# SIGTERM 触发服务的优雅退出（关闭监听、清理 service.lock）；
+# mixed = 先只给主进程发 SIGTERM，超时后再对整个 cgroup SIGKILL。
 KillSignal=SIGTERM
 KillMode=mixed
 TimeoutStopSec=30s
 
-# —— 安全加固（按需调整）——
+# ── 资源限制：防止单实例吃光宿主 ──
+MemoryMax=2G
+# MemoryHigh 是软限：超过后内核开始回收并压制分配 —— 把「被 OOM 直接杀掉」
+# 变成「变慢但仍存活」，给 GC 与请求退避留出反应时间。设成 MemoryMax 的 75% 左右。
+MemoryHigh=1536M
+CPUQuota=200%
+TasksMax=512
+LimitNOFILE=65536
+# 不产 core dump：内存转储里有明文渠道凭据与 API Key
+LimitCORE=0
+UMask=0077
+
+# ── 日志 ──
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ofm
+
+# ── 安全加固 ──
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
@@ -31,15 +92,31 @@ ProtectHome=true
 ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
+# AF_NETLINK 不能省：libuv 枚举网卡（getifaddrs）在 Linux 上走 netlink
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
 LockPersonality=true
-# 数据目录唯一可写位置（API Key / 账号凭据 / 账目）
+# 数据目录是唯一可写位置：API Key、明文渠道凭据、EAC 授权、账目统计、能力缓存都在这里
 ReadWritePaths=/var/lib/ofm
-# 渠道适配器需要出网；不限制地址族
-AmbientCapabilities=
 CapabilityBoundingSet=
+AmbientCapabilities=
+# 必须显式为 false：Node 的 JIT 与 Qoder WASM 需要同时可写可执行的内存页
+MemoryDenyWriteExecute=false
+
+# ── 刻意不开的两项（踩过坑，别加回来）──
+# ProtectProc=invisible /
+#   会让 clear-stale-lock.sh 读不到别的进程的 /proc/<pid>/cmdline。于是「锁里的 pid
+#   被系统复用给了其它服务」这一情形会退化成「无法判定 → 保守拒绝启动」，
+#   服务卡死且只能人工介入 —— 正好是本次要消灭的那个故障模式。
+# SystemCallFilter=@system-service /
+#   Node 的 JIT 与 WASM 需要 @system-service 集合之外的少数调用，加了有启动失败风险。
+#   确需启用请先在预发环境完整验证（启动 + 一次真实推理）。
 
 [Install]
 WantedBy=multi-user.target

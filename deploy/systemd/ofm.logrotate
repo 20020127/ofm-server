@@ -1,0 +1,30 @@
+# 文件日志轮转（可选，安装到 /etc/logrotate.d/ofm）
+#
+# 默认部署不需要这个文件：裸机方式下服务日志走 journald（由
+# /etc/systemd/journald.conf.d/ofm.conf 控制容量），nginx 日志走发行版自带的
+# /etc/logrotate.d/nginx。只有在「显式把应用日志重定向到文件」时才需要它 ——
+# 例如 nginx 配置里改了 access_log 路径、或用 wrapper 把 stdout 落盘到 /var/log/ofm/。
+#
+# 刻意只针对 /var/log/ofm/ 这一个目录：与发行版对 /var/log/nginx/*.log 的既有规则
+# 完全不重叠。logrotate 对同一文件出现两条配置会报 duplicate log entry 并跳过处理。
+/var/log/ofm/*.log {
+    daily
+    rotate 14
+    # - 前缀：文件不存在时不报错（首次运行、或日志尚未产出）
+    missingok
+    # 压缩旧日志；delaycompress 让最近一轮保持可读，便于刚轮转完还能直接看
+    compress
+    delaycompress
+    # 不因为日志为空就跳过轮转 —— 保持序列号与日期连续，便于按时间定位
+    notifempty
+    # 0640 ofm ofm：日志可能含渠道名与错误细节，不给 others 读
+    create 0640 ofm ofm
+    # 用 copytruncate：应用/nginx 一直持有原文件句柄，不重开文件的话
+    # 改名后日志会继续写进已改名的旧 inode。copytruncate 是「不重开句柄」场景下
+    # 唯一不会丢日志的做法（代价是轮转瞬间可能截断一条正在写的记录）。
+    copytruncate
+    dateext
+    dateformat -%Y%m%d-%s
+    # 单文件超过 100M 也触发轮转，避免某天突发流量把单个文件写到很大
+    maxsize 100M
+}

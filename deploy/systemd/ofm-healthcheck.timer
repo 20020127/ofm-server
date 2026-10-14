@@ -1,0 +1,18 @@
+[Unit]
+Description=Run the Our Free Model quick health probe periodically
+Documentation=file:/opt/ofm/docs/PRODUCTION.md
+
+[Timer]
+# 首次开机 3 分钟后开始（给启动流程留出余量），此后每 5 分钟一次。
+# 若同时在 OnBootSec 与 OnUnitActiveSec 上取值，systemd 会合并成一条固定节奏的排程。
+OnBootSec=3min
+OnUnitActiveSec=5min
+# 打散同一台机器上多个定时器的触发时刻，避免整点集中占用
+RandomizedDelaySec=20s
+AccuracySec=15s
+# 不用 Persistent：探针是有时效的观测，补跑错过的历史轮次没有意义
+Persistent=false
+Unit=ofm-healthcheck.service
+
+[Install]
+WantedBy=timers.target

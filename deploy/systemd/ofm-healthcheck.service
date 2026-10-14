@@ -1,0 +1,40 @@
+[Unit]
+Description=Our Free Model periodic health probe (quick: liveness + auth fence)
+Documentation=file:/opt/ofm/docs/PRODUCTION.md
+After=ofm.service
+# 服务还没起来时不必探测（启动阶段由 ofm.service 的 ExecStartPost 负责）
+Requisite=ofm.service
+
+[Service]
+Type=oneshot
+User=ofm
+Group=ofm
+
+# --quick 刻意不带 API Key 请求、不做推理冒烟：
+#   探针会高频运行，一次推理冒烟就吃掉一次上游额度，且把「上游抖动」误报成「本地不健康」。
+#   要验证业务链路请手工跑 --full。
+ExecStart=/opt/ofm/scripts/healthcheck.sh http://127.0.0.1:18900 /var/lib/ofm --quick
+
+# 探针失败不联动重启服务：
+#   重试由 restart 策略与入口监督负责，探测失败更可能是上游整体故障，
+#   此时反复重启只会放大问题。失败会写进 journal，交给告警采集。
+#   需要「探测连续失败即重启服务」请见 docs/PRODUCTION.md 的 OnFailure 写法。
+
+# ── 沙箱 ──
+NoNewPrivileges=true
+PrivateTmp=true
+# 用 full 而不是 strict：strict 会把 /var 置为只读，
+# 而本探针要真实校验「ofm 用户能否写数据目录」（--quick 的第 3 步），
+# 只读沙箱会让这个检查永远为假 —— 探针每条都误报不健康。
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ofm-health
