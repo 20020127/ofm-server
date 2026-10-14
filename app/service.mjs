@@ -4,6 +4,7 @@ import path from 'node:path'
 import { createModelRuntime, createRuntimeStores } from './src/core/runtime.js'
 import { generateKey, startForwardServer } from './src/forward.js'
 import { isLoopbackHost } from './src/trust.js'
+import { publicBaseUrl } from './src/public-url.js'
 import { createManagement } from './management.mjs'
 import { createStandaloneEac } from './eac.mjs'
 import { createChannelRuntime } from './channels/runtime.mjs'
@@ -79,9 +80,9 @@ export async function startStandalone({
     }
     management = createManagement({
       stores, runtime, channels, eac,
-      info: () => ({
+      info: req => ({
         product: PRODUCT, version: VERSION, dataDir,
-        baseUrl: `http://${host === '::1' ? '[::1]' : host}:${listener?.port ?? requestedPort}`,
+        baseUrl: publicBaseUrl(req, host, listener?.port ?? requestedPort),
         automaticRefresh: refresh,
         networkMode: process.env.OFM_TEST_UPSTREAM ? 'fixture' : 'live',
         capabilities: { anonymous: true, kilo: true, eac: true, accountChannels: true, webUi: true },

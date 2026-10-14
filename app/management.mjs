@@ -126,12 +126,12 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
       throw fail(500, '无法保存设置，请检查数据目录权限和磁盘空间')
     }
   }
-  const summary = () => {
+  const summary = req => {
     const state = runtime.state()
     const available = stores.availability.get()
     const routable = new Set(runtime.publicModelRows().map(entry => entry.id))
     return {
-      ...info(),
+      ...info(req),
       channels: channels?.state(),
       eacAuth: eac?.cached(),
       settings: managementSettings(stores.settings.get()),
@@ -189,7 +189,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
       sessions.delete(cookie(req))
       json(res, 200, { ok: true }, { 'set-cookie': clearCookie() })
     } else if (method === 'GET' && pathname === `${PREFIX}/summary`) {
-      json(res, 200, summary())
+      json(res, 200, summary(req))
     } else if (method === 'GET' && pathname === `${PREFIX}/stats`) {
       json(res, 200, buildStats(stores.stats.get(), runtime.catalog))
     } else if (method === 'POST' && pathname === `${PREFIX}/channels/rpc` && channels) {
@@ -200,7 +200,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
           if (typeof body.payload?.enabled !== 'boolean') throw fail(400, 'enabled 必须是布尔值')
           persist({ enabled: body.payload.enabled })
         }
-        const base = new URL(info().baseUrl)
+        const base = new URL(info(req).baseUrl)
         json(res, 200, { ok: true, value: {
           enabled: stores.settings.get().enabled !== false, running: stores.settings.get().enabled !== false,
           blockedByEnv: false, address: { host: base.hostname, port: Number(base.port) },
@@ -253,7 +253,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
       const body = await readBody(req)
       if (body.probe !== undefined && typeof body.probe !== 'boolean') throw fail(400, 'probe 必须是布尔值')
       await runtime.refreshCatalog({ probe: body.probe === true, force: body.probe === true })
-      json(res, 200, summary())
+      json(res, 200, summary(req))
     } else if (method === 'POST' && pathname === `${PREFIX}/models/test`) {
       const body = await readBody(req)
       if (stores.settings.get().enabled === false) throw fail(503, '推理服务已暂停，请先在服务设置中启用')

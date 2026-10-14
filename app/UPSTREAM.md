@@ -8,6 +8,7 @@
 - 提取内容：packages/standalone 运行时闭包 + src/ 核心 + vendor/channel-pack 资产 + web/ 预构建前端
 - 路径改写：packages/standalone 的深层相对导入（../../src、../../../vendor）已扁平化为 ../src、../vendor
 - 密钥脱敏：上游内置的 4 处第三方硬编码凭据已替换为环境变量覆盖（见 docs/COMPLIANCE.md 第 1b 节）
+- 服务器补丁：新增 src/public-url.js，令管理端展示的对外基地址具备反向代理感知能力（原为硬编码回环地址）；service.mjs / management.mjs 的对应改动见 tools/build-app.mjs 的 SERVER_PATCHES
 - 运行时依赖：无（仅 Node.js 内置模块，engines: "^22.19.0 || >=24.0.0"）
 
 上游 LICENSE 见本目录 LICENSE 文件，保留其版权声明即满足 MIT 要求。

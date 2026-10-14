@@ -21,6 +21,10 @@ nrm() { # nrm <file>  -> 打印规范化结果（折叠空白、去整行注释�
   [ -f "$1" ] || { echo ""; return; }
   sed 's/[[:space:]]\+/ /g' "$1" | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$'
 }
+docnrm() { # 文档专用：只折叠空白。markdown 的 # 是标题而非注释，不能用 nrm
+  [ -f "$1" ] || { echo ""; return; }
+  sed 's/[[:space:]]\+/ /g' "$1"
+}
 nrmraw() { # 保留注释（用于"刻意不写 X"这类注释性断言）
   [ -f "$1" ] || { echo ""; return; }
   sed 's/[[:space:]]\+/ /g' "$1"
@@ -35,6 +39,11 @@ flatchk(){ # 把续行（\ 换行）合并后再匹配，用于跨行指令（�
   else
     echo "  FAIL $1  [期望 $2 有跨行 /$3/]"; fail=$((fail+1))
   fi
+}
+docchk(){ if docnrm "$2"  | grep -qE "$3"; then echo "  OK   $1"; pass=$((pass+1)); else echo "  FAIL $1  [期望 $2 有 /$3/]"; fail=$((fail+1)); fi; }
+cntchk(){ # cntchk <描述> <文件> <模式> <期望行数> —— sed 逐行处理，跨行计数须逐行数
+  local n; n=$(nrm "$2" | grep -cE "$3")
+  if [ "$n" = "$4" ]; then echo "  OK   $1"; pass=$((pass+1)); else echo "  FAIL $1  [期望 $2 有 $4 行 /$3/，实际 $n 行]"; fail=$((fail+1)); fi
 }
 
 echo "[1] 环境与依赖"
@@ -172,6 +181,31 @@ chk "healthcheck service 用 Requisite"  deploy/systemd/ofm-healthcheck.service 
 chk "healthcheck service --quick"       deploy/systemd/ofm-healthcheck.service 'quick'
 chk "wait-ready 有超时兜底"             deploy/scripts/wait-ready.sh  'journalctl'
 chk "preflight 检查数据目录权限"        deploy/scripts/preflight.sh   '权限'
+
+echo "[6] 对外基地址（反向代理感知）"
+docchk "PRODUCTION.md 有 §3.3.1 小节"   docs/PRODUCTION.md           '^### 3\.3\.1 对外基地址'
+docchk "PRODUCTION.md 说明推导优先级"   docs/PRODUCTION.md           'OFM_PUBLIC_BASE_URL'
+docchk "PRODUCTION.md 记录实测根因"     docs/PRODUCTION.md           '硬编码'
+docchk "PRODUCTION.md 写明回滚方法"     docs/PRODUCTION.md           '退回「显示回环地址」'
+docchk "ARCHITECTURE.md 有 §2.3 小节"   docs/ARCHITECTURE.md         '^### 2\.3 对外基地址'
+docchk "ARCHITECTURE.md 说明可信判据"   docs/ARCHITECTURE.md         'Host.{0,14}已是回环名'
+docchk "ARCHITECTURE.md 源码索引含补丁" docs/ARCHITECTURE.md         'src/public-url\.js'
+chk "补丁模块存在"                       tools/patches/public-url.js  'export function publicBaseUrl'
+chk "补丁模块有回环可信判据"             tools/patches/public-url.js  'function fromTrustedProxy'
+chk "补丁模块有 authority 形态校验"      tools/patches/public-url.js  'function isPlainAuthority'
+chk "build 脚本声明 SERVER_PATCHES"     tools/build-app.mjs          'SERVER_PATCHES'
+chk "build 脚本拷入补丁模块"             tools/build-app.mjs          "patches', 'public-url\.js'"
+chk "app/service.mjs 引入补丁"           app/service.mjs              "import \{ publicBaseUrl \} from './src/public-url\.js'"
+chk "app/service.mjs 用补丁推 baseUrl"   app/service.mjs              'baseUrl: publicBaseUrl\(req,'
+chk "app/management.mjs summary 透传"    app/management.mjs           'summary\(req\)'
+chk "app/management.mjs info 透传"       app/management.mjs           'info\(req\)'
+chk "HTTP vhost 透传 X-Forwarded-Host"   deploy/nginx/ofm.conf        'proxy_set_header X-Forwarded-Host \$host;'
+chk "TLS vhost 透传 X-Forwarded-Host"    deploy/nginx/ofm-tls.conf    'proxy_set_header X-Forwarded-Host \$host;'
+chk "容器共享头透传 X-Forwarded-Host"    deploy/docker/ofm-proxy-headers.conf 'proxy_set_header X-Forwarded-Host \$host;'
+cntchk "HTTP vhost 三个 location 齐全"   deploy/nginx/ofm.conf        'proxy_set_header X-Forwarded-Host \$host;' 3
+cntchk "TLS vhost 三个 location 齐全"    deploy/nginx/ofm-tls.conf    'proxy_set_header X-Forwarded-Host \$host;' 3
+nchk "透传未顶替 Host 回环重写（HTTP）" deploy/nginx/ofm.conf        'proxy_set_header Host +\$host'
+nchk "透传未顶替 Host 回环重写（TLS）"  deploy/nginx/ofm-tls.conf    'proxy_set_header Host +\$host'
 
 echo
 echo "========================================"

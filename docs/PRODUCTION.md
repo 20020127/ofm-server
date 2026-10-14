@@ -10,9 +10,9 @@
 
 ## 0. 改动总览
 
-### 0.1 修复的五个生产级缺陷
+### 0.1 修复的六个生产级缺陷
 
-这五个是本轮加固的核心，都是「本地能跑、上服务器必出事」的类型：
+这六个是本轮加固的核心，都是「本地能跑、上服务器必出事」的类型：
 
 | # | 缺陷 | 触发条件 | 原表现 | 修复位置 |
 |---|---|---|---|---|
@@ -21,12 +21,16 @@
 | 3 | **日志无限增长** | 长期运行 | json-file 驱动默认**不轮转**，容器日志把磁盘写满 → 服务无法写盘 | compose `logging.options` + `systemd/journald-ofm.conf` + `ofm.logrotate` |
 | 4 | **重启策略覆盖不全** | 进程退出码为 0 的异常退出 | `Restart=on-failure` 不重启 → 服务静默死掉 | `Restart=always` + `StartLimitBurst` 防抖 |
 | 5 | **OOM 静默被杀** | 容器内存受限、宿主机内存大 | Node 按宿主机物理内存推算堆上限，撑爆 cgroup → **exit 137，日志里什么都没有** | 显式 `NODE_OPTIONS=--max-old-space-size` |
+| 6 | **对外地址显示成本机地址** | 经反向代理 + 域名 + TLS 暴露 | 上游把 `info().baseUrl` 硬编码成回环绑定地址，管理页「API 接入」展示的 API Base URL 与 curl 示例变成 `http://127.0.0.1:18900/v1`，用户照抄必然连不上 | 新增 `src/public-url.js` + 反代透传 `X-Forwarded-Host`（详见 §3.3.1） |
+
+第 6 条是**上线后实测发现**的：前五条都能在本机复现，唯独它只在「域名 + TLS 反代」的真实部署形态下才暴露 —— 本机直连时回环地址确实可达，所以一直没人发现。
 
 ### 0.2 新增文件清单
 
 | 文件 | 作用 |
 |---|---|
-| `deploy/docker/ofm-proxy-headers.conf` | 三个 location 共享的代理请求头片段（含关键的 Host/Origin 重写） |
+| `deploy/docker/ofm-proxy-headers.conf` | 三个 location 共享的代理请求头片段（含关键的 Host/Origin 重写与 X-Forwarded-Host 透传） |
+| `tools/patches/public-url.js` | 反向代理感知的对外基地址推导（构建期拷入 `app/src/`，见 §3.3.1） |
 | `deploy/scripts/clear-stale-lock.sh` | 陈旧锁自动判定与恢复，区分「陈旧」与「活跃实例」 |
 | `deploy/scripts/wait-ready.sh` | 就绪轮询，超时给出可执行的排查指引 |
 | `deploy/scripts/preflight.sh` | 启动前环境预检（权限、磁盘、内存、端口、锁） |
@@ -368,6 +372,64 @@ docker logs ofm 2>&1 | grep 管理页面
 ```
 
 **回滚**：直接删掉这些头会**立刻打断管理台**。回滚请改成「不透传」而非「透传原始值」。
+
+### 3.3.1 对外基地址：反向代理感知（否则用户照抄的地址连不上）
+
+**这条与上线后实测直接相关**：域名 `https://linghui.help` 切到 OFM 后，管理页「API 接入」显示的 API Base URL 仍是 `http://127.0.0.1:18900/v1`，curl 示例同样如此。这不是渠道坏了 —— 渠道推理功能完全正常 —— 而是**界面告诉用户的接入地址根本不可达**。
+
+**根因（上游代码，第 84 行附近）**：
+```js
+baseUrl: `http://${host === '::1' ? '[::1]' : host}:${listener?.port ?? requestedPort}`,
+```
+`host` 是服务实际绑定的地址（上游只允许绑回环，见 §3.5），所以这个值恒为 `http://127.0.0.1:18900`。这是上游「**本机桌面插件**」的合理假设 —— 插件就跑在用户机器上，回环地址确实可达。但服务器版经 nginx 反代 + 域名 + TLS 暴露时，它就成了错误答案。
+
+**改动（两处，缺一不可）**：
+
+1. **nginx 侧透传原始 Host**：三个 vhost 的每个 location（管理端、推理、前端）都补一行
+   ```nginx
+   proxy_set_header X-Forwarded-Host  $host;
+   ```
+   注意它**不替代** `proxy_set_header Host 127.0.0.1:18900` —— 后者是上游硬校验的闸门（见 §3.3），必须保持回环名；原始 Host 另走 `X-Forwarded-Host` 告诉上游，两者互不冲突。涉及文件：`deploy/nginx/ofm.conf`、`deploy/nginx/ofm-tls.conf`、`deploy/docker/ofm-proxy-headers.conf`。
+
+2. **Node 侧按反代头推导**：新增 `src/public-url.js`（由 `tools/build-app.mjs` 从 `tools/patches/public-url.js` 拷入，属**本仓库新增模块**，非上游代码），并把 `info()` 改为接收请求上下文：
+   ```js
+   info: req => ({ ..., baseUrl: publicBaseUrl(req, host, listener?.port ?? requestedPort) })
+   ```
+   `management.mjs` 的 `summary(req)` / `gateway.getEnabled(req)` 同步透传，让 `/api/management/overview` 与 SSE 推送都拿到当前请求的头。
+
+**推导优先级**（`publicBaseUrl(req, fallbackHost, fallbackPort)`）：
+
+| 优先级 | 来源 | 适用场景 |
+|---|---|---|
+| 1 | `OFM_PUBLIC_BASE_URL` 环境变量（显式声明，去掉结尾斜杠） | 反代不方便透传头时：CDN、多层网关、`Host` 被改写 |
+| 2 | 请求的 `X-Forwarded-Proto` + `X-Forwarded-Host` | 本仓库的反代形态，域名/证书更换无需改配置 |
+| 3 | 回环绑定地址 `http://127.0.0.1:<port>` | 上游原有行为，本机直连完全不受影响 |
+
+**安全设计（这条头是客户端可控的，不能无脑采信）**：
+
+- **可信判据**：仅当请求自身的 `Host` 已是回环名时才采信 `X-Forwarded-Host`。上游 `structuralRejection` 对管理端强制要求回环 Host，能走到这里的请求必然已过那道闸门，等价于「确认来自受信反代」；直连暴露到公网的部署则自动落到第 3 优先级，伪造头污染不进来。
+- **形态校验**：`isPlainAuthority()` 只放行 `DNS名[:端口]` 或 `[IPv6][:端口]`，拒绝空格、路径、`@` 用户信息、超长值，`proto` 也只接受 `http`/`https`。
+- **最小权限**：该值**只用于界面展示**，不参与任何出网请求构造，最坏情况只是显示一个错地址。
+
+**用法**：若反代链路会改写 `Host`（CDN、多层网关），不要依赖第 2 优先级，直接在环境里显式声明：
+```bash
+# systemd：/etc/default/ofm  或 compose environment
+OFM_PUBLIC_BASE_URL=https://linghui.help
+```
+
+**验证**：
+```bash
+# 经域名访问，baseUrl 应为 https://linghui.help（而不是 127.0.0.1）
+curl -s https://linghui.help/api/management/overview \
+  -H "Authorization: Bearer <令牌>" | grep -o '"baseUrl":"[^"]*"'
+
+# 反例：Host 非回环时不得采信伪造头（应仍返回回环地址）
+curl -s http://127.0.0.1:18900/api/management/overview \
+  -H "Host: evil.example" -H "X-Forwarded-Host: evil.example" \
+  -H "Authorization: Bearer <令牌>" | grep -o '"baseUrl":"[^"]*"'
+```
+
+**回滚**：删掉 `X-Forwarded-Host` 透传行即可退回「显示回环地址」的旧行为（不影响任何推理功能）；本仓库另有单元测试覆盖该模块的 21 项用例（含 9 项安全反例）。
 
 ### 3.4 只读根文件系统
 

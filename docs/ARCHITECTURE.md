@@ -79,6 +79,20 @@ SSE 流式回传（forward.js 的 serveCompletion）
 
 **统计。** 记录用量与性能（TTFT、解码速度、token 数），**不保存提示词和回答**。
 
+### 2.3 对外基地址的推导（本仓库新增）
+
+管理接口返回的 `info().baseUrl` 是前端「API 接入」面板与 curl 示例展示给用户的接入地址。上游把它硬编码成**回环绑定地址**（`http://127.0.0.1:18900`）—— 这是「本机桌面插件」的假设：插件与服务同机，回环地址可达。经反向代理 + 域名 + TLS 暴露时，这个值就变成用户照抄必败的死地址。
+
+本仓库新增 `src/public-url.js`（构建期从 `tools/patches/public-url.js` 拷入），推导优先级：
+
+| 优先级 | 来源 | 场景 |
+|---|---|---|
+| 1 | `OFM_PUBLIC_BASE_URL` 环境变量 | CDN / 多层网关等反代不方便透传头的形态 |
+| 2 | `X-Forwarded-Proto` + `X-Forwarded-Host` | 本仓库 nginx 反代形态（vhost 已透传原始 Host） |
+| 3 | 回环绑定地址 | 上游原有行为，本机直连不受影响 |
+
+`X-Forwarded-Host` 由客户端可控，因此**仅当请求自身的 `Host` 已是回环名时才采信**（上游 `structuralRejection` 对管理端强制要求回环 Host，能到达的请求必然已过闸门，等价于「确认来自受信反代」）；直连暴露时自动落到第 3 优先级。值本身还过一道 authority 形态校验（只放行 `DNS名[:端口]` / `[IPv6][:端口]`），且**只用于界面展示，不参与任何出网请求**。细节与回滚方法见 `docs/PRODUCTION.md` §3.3.1。
+
 ---
 
 ## 3. 鉴权机制（四层，相互独立）
@@ -157,13 +171,14 @@ channel-pack/            # 账号池、积分、账本、签到状态、CodeArts
 
 ## 5. 从插件到独立服务：重构做了什么
 
-上游 standalone 依赖完整仓库的相对路径，不能单独拷贝运行。本项目的 `tools/build-app.mjs` 做了三件事：
+上游 standalone 依赖完整仓库的相对路径，不能单独拷贝运行。本项目的 `tools/build-app.mjs` 做了四件事：
 
 1. **闭包提取**：从 `packages/standalone/cli.mjs` 与 `channels/worker.mjs` 两个入口遍历静态导入，复制 81 个运行时文件；
 2. **扁平化 + 路径改写**：`packages/standalone/*` 提升到 `app/` 根，`../../src/` → `./src/`、`../../../src/` → `../src/`、`../../../vendor/` → `../vendor/`（共 12 处，脚本自动完成，可重复执行）；
-3. **附带运行时资产**：`web/` 预构建前端、`src/providers/registry.json`（运行时 readFileSync 读取）、Qoder WASM、上游 LICENSE 与溯源文件 `UPSTREAM.md`。
+3. **附带运行时资产**：`web/` 预构建前端、`src/providers/registry.json`（运行时 readFileSync 读取）、Qoder WASM、上游 LICENSE 与溯源文件 `UPSTREAM.md`；
+4. **服务器部署补丁**（`SERVER_PATCHES`）：把 `info()` 改为接收请求上下文并引入 `src/public-url.js`，使对外基地址具备反向代理感知能力（见 §2.3）；另有构建期凭据脱敏（`REDACTIONS`）。
 
-**未修改任何业务逻辑**（diff 仅 import 路径）。`app/` 与上游 standalone 的行为逐字节一致。
+**业务逻辑未修改**（diff 仅 import 路径与上述补丁）。`app/` 与上游 standalone 在「本机直连」形态下行为一致；补丁只在反代场景下改变**展示用的基地址**，不影响任何请求路径与出网行为。
 
 ### 5.1 部署时要解决的一个硬约束
 
@@ -198,3 +213,4 @@ channel-pack/            # 账号池、积分、账本、签到状态、CodeArts
 | `channels/business.mjs` | 13 家渠道适配器与账号池逻辑（上游构建产物） |
 | `management.mjs` | 管理 API：会话、设置校验、密钥轮换、模型操作、静态资源（白名单读取） |
 | `src/trust.js` | 回环判定与结构化的跨站防护（structuralRejection） |
+| `src/public-url.js` | **本仓库新增**：反向代理感知的对外基地址推导（见 §2.3） |

@@ -132,6 +132,86 @@ function redactSecrets(text, relFor) {
   return text
 }
 
+/**
+ * 服务器部署补丁：让管理端展示的对外基地址具备「反向代理感知」能力。
+ *
+ * 这是本仓库相对上游的**唯一行为改动**，故在此打补丁而不是去改上游仓库
+ * （上游目录在仓库外，改了不会随提交保留）。
+ *
+ * 要解决的问题：上游 service.mjs 把 info().baseUrl 硬编码成回环绑定地址，
+ * 那是「本机桌面插件」的假设。服务器版经 nginx 反代 + 域名 + TLS 暴露时，
+ * 管理页「API 接入」展示的 API Base URL 与 curl 示例会变成用户打不开的本机
+ * 地址（实测经 https://linghui.help 访问，summary.baseUrl 仍返回
+ * http://127.0.0.1:18900）。详见 tools/patches/public-url.js 顶部说明。
+ *
+ * 防呆与脱敏同纪律：锚点未命中、或命中次数与预期不符，一律构建失败。
+ * 上游若重构了这些代码，我们宁可构建报错，也不要静默产出「补丁没打上」的 app/。
+ */
+const SERVER_PATCHES = [
+  {
+    file: 'service.mjs',
+    find: "import { isLoopbackHost } from './src/trust.js'",
+    replace: "import { isLoopbackHost } from './src/trust.js'\nimport { publicBaseUrl } from './src/public-url.js'",
+    what: '引入 publicBaseUrl',
+  },
+  {
+    file: 'service.mjs',
+    find: "        baseUrl: `http://${host === '::1' ? '[::1]' : host}:${listener?.port ?? requestedPort}`,",
+    replace: '        baseUrl: publicBaseUrl(req, host, listener?.port ?? requestedPort),',
+    what: 'baseUrl 改为反向代理感知',
+  },
+  {
+    file: 'service.mjs',
+    find: '      info: () => ({',
+    replace: '      info: req => ({',
+    what: 'info 接收请求上下文',
+  },
+  {
+    file: 'management.mjs',
+    find: '  const summary = () => {',
+    replace: '  const summary = req => {',
+    what: 'summary 接收请求上下文',
+  },
+  {
+    file: 'management.mjs',
+    find: '      ...info(),',
+    replace: '      ...info(req),',
+    what: 'summary 透传 req 给 info',
+  },
+  {
+    file: 'management.mjs',
+    find: '        const base = new URL(info().baseUrl)',
+    replace: '        const base = new URL(info(req).baseUrl)',
+    what: 'gateway.getEnabled 透传 req',
+  },
+  {
+    // /summary 与 /models/refresh 两处，数量写死为 2，多一处少一处都算漂移
+    file: 'management.mjs',
+    find: 'json(res, 200, summary())',
+    replace: 'json(res, 200, summary(req))',
+    what: 'summary 调用点透传 req',
+    all: true,
+    expect: 2,
+  },
+]
+
+function patchServerDeployment(relTarget, text) {
+  for (const patch of SERVER_PATCHES) {
+    if (patch.file !== relTarget) continue
+    const count = text.split(patch.find).length - 1
+    const expect = patch.expect ?? 1
+    if (count !== expect) {
+      console.error(`服务器补丁失败：${relTarget} 锚点「${patch.what}」出现 ${count} 次，期望 ${expect} 次`)
+      console.error(`  期望匹配：${patch.find}`)
+      console.error('  上游代码可能已重构；请更新 SERVER_PATCHES 后重试，不要绕过该校验。')
+      process.exit(1)
+    }
+    text = patch.all ? text.replaceAll(patch.find, patch.replace) : text.replace(patch.find, patch.replace)
+    console.log(`  patch: ${relTarget} <- ${patch.what}${patch.all ? `（${count} 处）` : ''}`)
+  }
+  return text
+}
+
 const entries = ['packages/standalone/cli.mjs', 'packages/standalone/channels/worker.mjs']
 const { files, missing } = closure(entries)
 if (missing.length > 0) {
@@ -150,6 +230,7 @@ for (const abs of files) {
     const relFor = path.relative(out, target).replaceAll(path.sep, '/')
     let text = fs.readFileSync(abs, 'utf8')
     text = rewrite(relFor, text)
+    text = patchServerDeployment(relFor, text)
     text = redactSecrets(text, relFor)
     fs.writeFileSync(target, text)
   } else {
@@ -189,6 +270,18 @@ function walkDir(dir) {
   return out
 }
 
+// 服务器部署新增模块：反向代理感知的对外基地址（本仓库独有，非上游代码）。
+// 放这里而不是 extras，是因为它没有上游来源，纯粹是本仓库的增量。
+{
+  const from = path.join(here, 'patches', 'public-url.js')
+  const to = path.join(out, 'src', 'public-url.js')
+  if (!fs.existsSync(from)) { console.error('缺少补丁模块：tools/patches/public-url.js'); process.exit(1) }
+  fs.mkdirSync(path.dirname(to), { recursive: true })
+  fs.copyFileSync(from, to)
+  copied.push('src/public-url.js')
+  console.log('  patch: + src/public-url.js（反向代理感知的对外基地址）')
+}
+
 // 重写 package.json：去掉插件/构建相关字段，保留 engines 与版本
 const pkg = JSON.parse(fs.readFileSync(path.join(upstream, 'packages', 'standalone', 'package.json'), 'utf8'))
 const upstreamVersion = JSON.parse(fs.readFileSync(path.join(upstream, 'package.json'), 'utf8')).version
@@ -216,6 +309,7 @@ const provenance = `# 来源与溯源
 - 提取内容：packages/standalone 运行时闭包 + src/ 核心 + vendor/channel-pack 资产 + web/ 预构建前端
 - 路径改写：packages/standalone 的深层相对导入（../../src、../../../vendor）已扁平化为 ../src、../vendor
 - 密钥脱敏：上游内置的 4 处第三方硬编码凭据已替换为环境变量覆盖（见 docs/COMPLIANCE.md 第 1b 节）
+- 服务器补丁：新增 src/public-url.js，令管理端展示的对外基地址具备反向代理感知能力（原为硬编码回环地址）；service.mjs / management.mjs 的对应改动见 tools/build-app.mjs 的 SERVER_PATCHES
 - 运行时依赖：无（仅 Node.js 内置模块，engines: ${JSON.stringify(pkg.engines.node)}）
 
 上游 LICENSE 见本目录 LICENSE 文件，保留其版权声明即满足 MIT 要求。
